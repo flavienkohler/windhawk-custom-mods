@@ -7,6 +7,7 @@ Personal [Windhawk](https://windhawk.net) mods, written to fix or replace behavi
 | Mod | Description |
 | --- | --- |
 | [auto-hide-taskbar](auto-hide-taskbar) | Hides each taskbar only when a window on its own monitor is maximized or overlaps it. |
+| [taskbar-media-island](taskbar-media-island) | A simple, minimalistic media control (track, artist, previous / play-pause / next) on the taskbar of the monitors of your choice. |
 
 ## Install a mod
 
