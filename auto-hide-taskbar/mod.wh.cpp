@@ -2,12 +2,12 @@
 // @id              auto-hide-taskbar
 // @name            Auto-Hide Taskbar (per monitor)
 // @description     Hides each taskbar only when a window on its own monitor is maximized or overlaps it
-// @version         1.0.0
+// @version         1.3.0
 // @author          flavienkohler
 // @github          https://github.com/flavienkohler
 // @include         explorer.exe
 // @architecture    x86-64
-// @compilerOptions -ldwmapi -lole32 -loleaut32 -lversion
+// @compilerOptions -ldwmapi -lole32 -loleaut32 -luuid -lversion
 // ==/WindhawkMod==
 
 // Source code is published under The GNU General Public License v3.0.
@@ -18,8 +18,9 @@
 // Most of the taskbar hooking, the Alt+Tab / Win+Tab handling and the program
 // exclusion are his work. Modified by flavienkohler on 2026-10-20: the decision
 // is taken for each monitor on its own, monitors can be left alone, the options
-// and the support of other Windows versions were removed, and the gap of
-// Chromium-based apps is removed.
+// and the support of other Windows versions were removed, the gap of
+// Chromium-based apps is removed, and the space of a taskbar that stays visible
+// is kept out of the work area.
 
 // ==WindhawkModReadme==
 /*
@@ -28,6 +29,8 @@
 The taskbar stays visible, and slides away only when a window on **the same monitor** is maximized, fullscreen, or overlaps the taskbar area. Windows on another monitor never affect it. Hovering the screen edge reveals the taskbar as usual.
 
 Taskbars on monitors that are not selected in the settings are always visible.
+
+When the taskbar stays visible because of an excluded program, or because its monitor is not managed, maximized windows stop above it instead of going under it.
 
 Chromium-based apps (Chrome, VSCodium, Discord, ...) normally leave a 2 px gap at the bottom of a maximized window when the taskbar auto-hides. By default this mod hides the auto-hide state from applications on the managed monitors, so they maximize to the true screen edge.
 
@@ -47,6 +50,9 @@ Derived from [Taskbar auto-hide when maximized](https://windhawk.net/mods/taskba
 - maximizeToEdge: true
   $name: Maximize windows to the screen edge
   $description: Chromium-based apps (Chrome, VSCodium, Discord, ...) leave a 2 px gap at the screen edge when maximized with an auto-hide taskbar. Enable this to make them use the whole screen on the monitors managed by the mod. It applies to windows maximized afterwards, and the taskbar is still revealed by moving the pointer to the screen edge.
+- reserveSpace: true
+  $name: Keep the space of a visible taskbar
+  $description: When the taskbar stays visible because of an excluded program, or because its monitor is not managed by the mod, maximized windows stop above the taskbar instead of going under it.
 - excludedPrograms: [""]
   $name: Excluded programs
   $description: >-
@@ -57,9 +63,11 @@ Derived from [Taskbar auto-hide when maximized](https://windhawk.net/mods/taskba
 #include <windhawk_utils.h>
 
 #include <dwmapi.h>
+#include <uiautomationclient.h>
 
 #include <winrt/base.h>
 
+#include <algorithm>
 #include <atomic>
 #include <mutex>
 #include <string>
@@ -76,6 +84,7 @@ enum class Monitors {
 struct {
     Monitors monitors;
     bool maximizeToEdge;
+    bool reserveSpace;
     std::unordered_set<std::wstring> excludedPrograms;
 } g_settings;
 
@@ -107,6 +116,9 @@ static const UINT g_getTaskbarRectRegisteredMsg =
 
 static const UINT g_updateTaskbarStateRegisteredMsg =
     RegisterWindowMessage(L"Windhawk_UpdateTaskbarState_" WH_MOD_ID);
+
+static const UINT g_releaseWorkAreaRegisteredMsg =
+    RegisterWindowMessage(L"Windhawk_ReleaseWorkArea_" WH_MOD_ID);
 
 enum {
     kTrayUITimerHide = 2,
@@ -473,33 +485,44 @@ bool IsMonitorManaged(HMONITOR monitor) {
     return (g_settings.monitors == Monitors::primary) == isPrimary;
 }
 
-// Whether the window, being on the given monitor, should hide its taskbar.
-bool CanHideTaskbarForWindow(HWND hWnd,
-                             HMONITOR monitor,
-                             const RECT* taskbarRect) {
+enum class Cover {
+    none,
+    nextTo,  // Does not cover the taskbar, but is just above it.
+    covers,
+};
+
+// How the window, being on the given monitor, covers its taskbar. A window that
+// covers it hides the taskbar, unless its program is excluded. nearRect is the
+// taskbar rectangle with a margin, see ShouldKeepTaskbarShown. The rectangle of
+// the window is returned if it covers the taskbar or is next to it.
+Cover GetWindowCover(HWND hWnd,
+                     HMONITOR monitor,
+                     const RECT* taskbarRect,
+                     const RECT* nearRect,
+                     RECT* windowRect) {
     if (!IsWindowVisible(hWnd) || IsWindowCloaked(hWnd) || IsIconic(hWnd) ||
         (GetWindowLong(hWnd, GWL_EXSTYLE) &
          (WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW))) {
-        return false;
+        return Cover::none;
     }
 
     // Ignore the Alt+Tab overlay so it doesn't affect taskbar state.
     if (hWnd == g_altTabViewHwnd) {
-        return false;
+        return Cover::none;
     }
 
     if (hWnd == GetShellWindow() || GetProp(hWnd, L"DesktopWindow")) {
-        return false;
+        return Cover::none;
     }
 
     // Exclude menus (#32768).
     if (GetClassWord(hWnd, GCW_ATOM) == 32768) {
-        return false;
+        return Cover::none;
     }
 
-    // Check this after the other checks, as it's the most expensive one.
-    if (IsWindowExcluded(hWnd)) {
-        return false;
+    if (FAILED(DwmGetWindowAttribute(hWnd, DWMWA_EXTENDED_FRAME_BOUNDS,
+                                     windowRect, sizeof(*windowRect)))) {
+        GetWindowRect(hWnd, windowRect);
     }
 
     // A maximized window counts for the monitor it is on, and only for it.
@@ -508,44 +531,429 @@ bool CanHideTaskbarForWindow(HWND hWnd,
     };
 
     if (GetWindowPlacement(hWnd, &wp) && wp.showCmd == SW_SHOWMAXIMIZED) {
-        return MonitorFromWindow(hWnd, MONITOR_DEFAULTTONEAREST) == monitor;
+        return MonitorFromWindow(hWnd, MONITOR_DEFAULTTONEAREST) == monitor
+                   ? Cover::covers
+                   : Cover::none;
     }
 
     // Any other window (including fullscreen and snapped ones) counts when it
     // overlaps the taskbar of this monitor.
-    RECT windowRect{};
-    if (FAILED(DwmGetWindowAttribute(hWnd, DWMWA_EXTENDED_FRAME_BOUNDS,
-                                     &windowRect, sizeof(windowRect)))) {
-        GetWindowRect(hWnd, &windowRect);
+    RECT intersectRect;
+    if (IntersectRect(&intersectRect, windowRect, taskbarRect)) {
+        return Cover::covers;
     }
 
-    RECT intersectRect;
-    return IntersectRect(&intersectRect, &windowRect, taskbarRect);
+    if (IntersectRect(&intersectRect, windowRect, nearRect)) {
+        return Cover::nextTo;
+    }
+
+    return Cover::none;
 }
 
+// The taskbar is always set to auto-hide, so Windows does not keep its space
+// out of the work area, and maximized windows go under it when it is shown.
+// That is wanted while the taskbar waits for a window to cover it, but not
+// when it stays shown for a lasting reason (excluded program, monitor not
+// managed by the mod). In that case the space of the taskbar is subtracted from
+// the work area, and Windows resizes the maximized windows.
+std::atomic<bool> g_unloading;
+
+struct ReservedSpace {
+    RECT rect;  // Kept out of the work area, in screen pixels.
+    HWND taskbarWnd;
+};
+
+std::mutex g_reservedSpaceMutex;
+std::unordered_map<HMONITOR, ReservedSpace> g_reservedSpace;
+
+bool g_workAreaSupported;  // The symbols are found, set at init.
+
+void* g_cTray;        // The CTray of explorer, seen by RecomputeWorkArea.
+void* g_cTrayStatic;  // c_trayStatic, which contains the CTray.
+void* g_trayUIHostVftable;
+
+using CTray_RecomputeWorkArea_t = int(WINAPI*)(void* pThis,
+                                               HMONITOR monitor,
+                                               RECT* workArea);
+CTray_RecomputeWorkArea_t CTray_RecomputeWorkArea_Original;
+
+using CTray_WorkAreaMayHaveChanged_t = void(WINAPI*)(void* pThis,
+                                                     HMONITOR monitor,
+                                                     HWND hWnd);
+CTray_WorkAreaMayHaveChanged_t CTray_WorkAreaMayHaveChanged_Original;
+
+////////////////////////////////////////////////////////////////////////////////
+// The taskbar window can be taller than the bar that is seen, for example when
+// the taskbar is styled to float with margins. The space kept out of the work
+// area starts at the top of the visible bar, so that maximized windows end at
+// the bar, without a strip of wallpaper in between. The distance between the
+// top of the taskbar window and the top of the bar is measured with UI
+// Automation, which must not be called from the thread of the taskbar (it would
+// wait for itself), hence a worker thread and a cache.
+
+std::mutex g_barMutex;
+std::unordered_map<HWND, LONG> g_barInsets;  // Taskbar window -> inset.
+std::unordered_set<HWND> g_barRequests;
+HANDLE g_barThread;
+HANDLE g_barStopEvent;
+HANDLE g_barWakeEvent;
+
+bool GetBarInset(HWND taskbarWnd, LONG* inset) {
+    std::lock_guard<std::mutex> guard(g_barMutex);
+    auto it = g_barInsets.find(taskbarWnd);
+    if (it == g_barInsets.end()) {
+        return false;
+    }
+
+    *inset = it->second;
+    return true;
+}
+
+void RequestBarMeasure(HWND taskbarWnd) {
+    {
+        std::lock_guard<std::mutex> guard(g_barMutex);
+        g_barRequests.insert(taskbarWnd);
+    }
+
+    if (g_barWakeEvent) {
+        SetEvent(g_barWakeEvent);
+    }
+}
+
+bool MeasureBarInset(IUIAutomation* automation,
+                     IUIAutomationCondition* condition,
+                     HWND taskbarWnd,
+                     LONG* inset) {
+    RECT windowRect;
+    if (!GetWindowRect(taskbarWnd, &windowRect)) {
+        return false;
+    }
+
+    winrt::com_ptr<IUIAutomationElement> root;
+    winrt::com_ptr<IUIAutomationElement> frame;
+    RECT frameRect;
+    if (FAILED(automation->ElementFromHandle((UIA_HWND)taskbarWnd,
+                                             root.put())) ||
+        !root ||
+        FAILED(root->FindFirst(TreeScope_Descendants, condition,
+                               frame.put())) ||
+        !frame || FAILED(frame->get_CurrentBoundingRectangle(&frameRect))) {
+        return false;
+    }
+
+    LONG value = frameRect.top - windowRect.top;
+    if (IsRectEmpty(&frameRect) || value < 0 ||
+        value > (windowRect.bottom - windowRect.top) / 2) {
+        return false;
+    }
+
+    *inset = value;
+    return true;
+}
+
+DWORD WINAPI BarThread(LPVOID) {
+    SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+
+    if (FAILED(CoInitializeEx(nullptr, COINIT_MULTITHREADED))) {
+        return 1;
+    }
+
+    {
+        winrt::com_ptr<IUIAutomation> automation;
+        winrt::com_ptr<IUIAutomationCondition> condition;
+
+        VARIANT className;
+        VariantInit(&className);
+        className.vt = VT_BSTR;
+        className.bstrVal = SysAllocString(L"Taskbar.TaskbarFrameAutomationPeer");
+
+        if (SUCCEEDED(CoCreateInstance(CLSID_CUIAutomation, nullptr,
+                                       CLSCTX_INPROC_SERVER, IID_IUIAutomation,
+                                       automation.put_void()))) {
+            automation->CreatePropertyCondition(UIA_ClassNamePropertyId,
+                                                className, condition.put());
+        }
+        VariantClear(&className);
+
+        if (!automation || !condition) {
+            Wh_Log(L"UI Automation is not available, the space of the whole "
+                   L"taskbar window is kept");
+        }
+
+        HANDLE events[] = {g_barStopEvent, g_barWakeEvent};
+        for (;;) {
+            // Also measure again from time to time, the style can change.
+            DWORD wait = WaitForMultipleObjects(ARRAYSIZE(events), events,
+                                                FALSE, 5000);
+            if (wait == WAIT_OBJECT_0) {
+                break;
+            }
+
+            std::unordered_set<HWND> toMeasure;
+            {
+                std::lock_guard<std::mutex> guard(g_barMutex);
+                toMeasure.swap(g_barRequests);
+            }
+
+            if (wait == WAIT_TIMEOUT) {
+                std::lock_guard<std::mutex> guard(g_reservedSpaceMutex);
+                for (const auto& [monitor, reserved] : g_reservedSpace) {
+                    toMeasure.insert(reserved.taskbarWnd);
+                }
+            }
+
+            for (HWND taskbarWnd : toMeasure) {
+                LONG inset = 0;
+                bool measured =
+                    automation && condition &&
+                    MeasureBarInset(automation.get(), condition.get(),
+                                    taskbarWnd, &inset);
+
+                bool changed;
+                {
+                    std::lock_guard<std::mutex> guard(g_barMutex);
+                    auto it = g_barInsets.find(taskbarWnd);
+
+                    // When it cannot be measured, the whole window is kept.
+                    changed = it == g_barInsets.end() ||
+                              (measured && it->second != inset);
+                    if (changed) {
+                        g_barInsets[taskbarWnd] = inset;
+                    }
+                }
+
+                if (changed) {
+                    Wh_Log(L"Visible bar of taskbar %08X: inset %ld px%s",
+                           (DWORD)(DWORD_PTR)taskbarWnd, inset,
+                           measured ? L"" : L" (not measured)");
+                    PostMessage(taskbarWnd, g_updateTaskbarStateRegisteredMsg, 0,
+                                0);
+                }
+            }
+        }
+    }
+
+    CoUninitialize();
+    return 0;
+}
+
+void StartBarThread() {
+    g_barStopEvent = CreateEvent(nullptr, TRUE, FALSE, nullptr);
+    g_barWakeEvent = CreateEvent(nullptr, FALSE, FALSE, nullptr);
+    if (g_barStopEvent && g_barWakeEvent) {
+        g_barThread = CreateThread(nullptr, 0, BarThread, nullptr, 0, nullptr);
+    }
+}
+
+void StopBarThread() {
+    if (g_barThread) {
+        SetEvent(g_barStopEvent);
+        WaitForSingleObject(g_barThread, 10000);
+        CloseHandle(g_barThread);
+        g_barThread = nullptr;
+    }
+
+    for (HANDLE* handle : {&g_barStopEvent, &g_barWakeEvent}) {
+        if (*handle) {
+            CloseHandle(*handle);
+            *handle = nullptr;
+        }
+    }
+}
+
+////////////////////////////////////////////////////////////////////////////////
+
+// The work area is computed by explorer, after that the taskbar is subtracted
+// from it for the monitors with a reserved space. The return value of
+// RecomputeWorkArea tells whether the computed work area differs from the
+// current one of the monitor, and the callers apply it only in that case. With
+// auto-hide explorer computes the whole monitor, which is the current work
+// area, hence 0, so the return value is computed again after the subtraction.
+int WINAPI CTray_RecomputeWorkArea_Hook(void* pThis,
+                                        HMONITOR monitor,
+                                        RECT* workArea) {
+    g_cTray = pThis;
+
+    int ret = CTray_RecomputeWorkArea_Original(pThis, monitor, workArea);
+
+    if (!workArea || IsRectEmpty(workArea)) {
+        return ret;
+    }
+
+    RECT reservedRect{};
+    {
+        std::lock_guard<std::mutex> guard(g_reservedSpaceMutex);
+        auto it = g_reservedSpace.find(monitor);
+        if (it != g_reservedSpace.end()) {
+            reservedRect = it->second.rect;
+        }
+    }
+
+    MONITORINFO monitorInfo{.cbSize = sizeof(monitorInfo)};
+    if (!IsRectEmpty(&reservedRect) && GetMonitorInfo(monitor, &monitorInfo)) {
+        SubtractRect(workArea, workArea, &reservedRect);
+        ret = EqualRect(workArea, &monitorInfo.rcWork) ? 0 : 1;
+        Wh_Log(L"Work area of monitor %p: {%d,%d,%d,%d}, current {%d,%d,%d,%d}, "
+               L"%s",
+               monitor, workArea->left, workArea->top, workArea->right,
+               workArea->bottom, monitorInfo.rcWork.left,
+               monitorInfo.rcWork.top, monitorInfo.rcWork.right,
+               monitorInfo.rcWork.bottom, ret ? L"applied" : L"unchanged");
+    }
+
+    return ret;
+}
+
+// The interface of the CTray on which WorkAreaMayHaveChanged is called is
+// found with its vftable rather than with a fixed offset, and nothing is called
+// if it is not found.
+void* FindTrayUIHost(void* cTray) {
+    if (!cTray || !g_trayUIHostVftable) {
+        return nullptr;
+    }
+
+    for (size_t offset = 0; offset < 0x100; offset += sizeof(void*)) {
+        void** slot = reinterpret_cast<void**>(static_cast<char*>(cTray) +
+                                               offset);
+        if (*slot == g_trayUIHostVftable) {
+            return slot;
+        }
+    }
+
+    return nullptr;
+}
+
+// Asks explorer to compute the work area of the monitor again, and to apply it.
+void NotifyWorkAreaChanged(HMONITOR monitor) {
+    if (!CTray_WorkAreaMayHaveChanged_Original) {
+        return;
+    }
+
+    void* host = FindTrayUIHost(g_cTray ? g_cTray : g_cTrayStatic);
+    if (!host) {
+        Wh_Log(L"CTray not found, the work area is not updated");
+        return;
+    }
+
+    CTray_WorkAreaMayHaveChanged_Original(host, monitor, nullptr);
+}
+
+bool IsSpaceReserved(HMONITOR monitor) {
+    std::lock_guard<std::mutex> guard(g_reservedSpaceMutex);
+    return g_reservedSpace.contains(monitor);
+}
+
+void UpdateReservedSpace(HWND taskbarWnd,
+                         HMONITOR monitor,
+                         bool reserve,
+                         const RECT& taskbarRect) {
+    reserve = reserve && g_settings.reserveSpace && !g_unloading &&
+              g_workAreaSupported && !IsRectEmpty(&taskbarRect);
+
+    RECT rect = taskbarRect;
+    if (reserve && g_barThread) {
+        // The space starts at the visible bar. Reserving only once it is
+        // measured avoids resizing the windows twice, a message is posted to
+        // the taskbar when the measure is done.
+        LONG inset;
+        if (GetBarInset(taskbarWnd, &inset)) {
+            rect.top += inset;
+        } else {
+            RequestBarMeasure(taskbarWnd);
+            reserve = false;
+        }
+    }
+
+    bool changed;
+    {
+        std::lock_guard<std::mutex> guard(g_reservedSpaceMutex);
+        auto it = g_reservedSpace.find(monitor);
+
+        if (reserve) {
+            changed = it == g_reservedSpace.end() ||
+                      !EqualRect(&it->second.rect, &rect);
+            g_reservedSpace[monitor] = {rect, taskbarWnd};
+        } else {
+            changed = it != g_reservedSpace.end();
+            if (changed) {
+                g_reservedSpace.erase(it);
+            }
+        }
+    }
+
+    if (changed) {
+        Wh_Log(L"Space of the taskbar of monitor %p: %s", monitor,
+               reserve ? L"reserved" : L"released");
+        NotifyWorkAreaChanged(monitor);
+    }
+}
+
+void ReleaseReservedSpace() {
+    std::unordered_map<HMONITOR, ReservedSpace> released;
+    {
+        std::lock_guard<std::mutex> guard(g_reservedSpaceMutex);
+        released.swap(g_reservedSpace);
+    }
+
+    for (const auto& [monitor, reserved] : released) {
+        NotifyWorkAreaChanged(monitor);
+    }
+}
+
+// Whether the taskbar of the monitor is kept shown. It also decides whether
+// the space of the taskbar is kept out of the work area.
 bool ShouldKeepTaskbarShown(HWND hTaskbarWnd, HMONITOR monitor) {
+    RECT taskbarRect{};
+    GetTaskbarRectForMonitor(monitor, &taskbarRect);
+
+    auto result = [&](bool keepShown, bool reserveSpace) {
+        UpdateReservedSpace(hTaskbarWnd, monitor, reserveSpace, taskbarRect);
+        return keepShown;
+    };
+
     if (!IsMonitorManaged(monitor)) {
         Wh_Log(L"Taskbar %08X: monitor not managed, keeping shown",
                (DWORD)(DWORD_PTR)hTaskbarWnd);
-        return true;
+        return result(true, true);
     }
 
     // Always show taskbar when MultitaskingView (Win+Tab) is active.
     if (g_multitaskingViewHwnd) {
         Wh_Log(L"Taskbar %08X: Win+Tab active, keeping shown",
                (DWORD)(DWORD_PTR)hTaskbarWnd);
-        return true;
+        return result(true, false);
     }
 
-    RECT taskbarRect{};
-    GetTaskbarRectForMonitor(monitor, &taskbarRect);
     if (IsRectEmpty(&taskbarRect)) {
         Wh_Log(L"Taskbar %08X: empty taskbar rect, only maximized windows "
                L"will be detected",
                (DWORD)(DWORD_PTR)hTaskbarWnd);
     }
 
+    // While the space of the taskbar is reserved, the windows are resized to
+    // end just above the taskbar, and do not overlap it anymore. They still
+    // have to keep the space reserved, otherwise they would grow back under the
+    // taskbar, which would reserve the space again, and so on.
+    RECT nearRect = taskbarRect;
+    if (IsSpaceReserved(monitor)) {
+        nearRect.top -= 32;
+    }
+
     bool canHideTaskbar = false;
+    bool excludedWindowCovers = false;
+
+    // The windows are listed from the top of the z-order. A window that hides
+    // the taskbar and fully contains an excluded window that is below it hides
+    // that window, which then does not need the taskbar.
+    std::vector<RECT> hidingWindows;
+
+    auto contains = [](const RECT& outer, const RECT& inner) {
+        constexpr LONG kMargin = 2;
+        return inner.left >= outer.left - kMargin &&
+               inner.top >= outer.top - kMargin &&
+               inner.right <= outer.right + kMargin &&
+               inner.bottom <= outer.bottom + kMargin;
+    };
 
     DWORD dwTaskbarThreadId = GetCurrentThreadId();
 
@@ -554,16 +962,38 @@ bool ShouldKeepTaskbarShown(HWND hTaskbarWnd, HMONITOR monitor) {
             return TRUE;
         }
 
-        canHideTaskbar = CanHideTaskbarForWindow(hWnd, monitor, &taskbarRect);
-        if (!canHideTaskbar) {
+        RECT windowRect;
+        Cover cover = GetWindowCover(hWnd, monitor, &taskbarRect, &nearRect,
+                                     &windowRect);
+        if (cover == Cover::none) {
             return TRUE;
         }
 
-        Wh_Log(L"Taskbar %08X (rect={%d,%d,%d,%d}) can hide for %s",
-               (DWORD)(DWORD_PTR)hTaskbarWnd, taskbarRect.left,
-               taskbarRect.top, taskbarRect.right, taskbarRect.bottom,
-               GetWindowLogInfo(hWnd).c_str());
-        return FALSE;
+        // Resolving the program is the most expensive check, so it is done
+        // only for the windows that cover or are next to the taskbar.
+        if (IsWindowExcluded(hWnd)) {
+            bool hidden = std::any_of(
+                hidingWindows.begin(), hidingWindows.end(),
+                [&](const RECT& hiding) { return contains(hiding, windowRect); });
+            if (!hidden) {
+                excludedWindowCovers = true;
+            }
+            return TRUE;
+        }
+
+        if (cover == Cover::covers) {
+            if (!canHideTaskbar) {
+                Wh_Log(L"Taskbar %08X (rect={%d,%d,%d,%d}) can hide for %s",
+                       (DWORD)(DWORD_PTR)hTaskbarWnd, taskbarRect.left,
+                       taskbarRect.top, taskbarRect.right, taskbarRect.bottom,
+                       GetWindowLogInfo(hWnd).c_str());
+            }
+
+            canHideTaskbar = true;
+            hidingWindows.push_back(windowRect);
+        }
+
+        return TRUE;
     };
 
     EnumWindows(
@@ -573,7 +1003,15 @@ bool ShouldKeepTaskbarShown(HWND hTaskbarWnd, HMONITOR monitor) {
         },
         reinterpret_cast<LPARAM>(&enumWindowsProc));
 
-    return !canHideTaskbar;
+    // A window of an excluded program that can be seen keeps the taskbar, even
+    // when another window that is not excluded covers it too, for example on
+    // the other half of the screen. Its space is kept out of the work area.
+    if (excludedWindowCovers && canHideTaskbar) {
+        Wh_Log(L"Taskbar %08X: kept shown for an excluded window",
+               (DWORD)(DWORD_PTR)hTaskbarWnd);
+    }
+
+    return result(!canHideTaskbar || excludedWindowCovers, excludedWindowCovers);
 }
 
 // Chromium-based apps (Chrome, Electron apps, ...) stop 2 px short of a screen
@@ -598,8 +1036,6 @@ constexpr UINT kAppBarStateAutoHide = 0x1;  // ABS_AUTOHIDE
 std::mutex g_appBarPropsMutex;
 std::unordered_map<std::wstring, HANDLE> g_hiddenAppBarProps;
 std::atomic<DWORD> g_appBarMessageThreadId;
-std::atomic<bool> g_unloading;
-
 using SetPropW_t = decltype(&SetPropW);
 SetPropW_t SetPropW_Original;
 
@@ -941,6 +1377,9 @@ LRESULT WINAPI TrayUI_WndProc_Hook(void* pThis,
         if (!TrayUI_GetStuckRectForMonitor_Original(pThis, monitor, rect)) {
             SetRectEmpty(rect);
         }
+    } else if (Msg == g_releaseWorkAreaRegisteredMsg) {
+        ReleaseReservedSpace();
+        return 0;
     } else if (Msg == g_updateTaskbarStateRegisteredMsg) {
         UpdateAppBarProps(hWnd);
 
@@ -1377,6 +1816,37 @@ bool HookExplorerSymbols() {
                        ARRAYSIZE(symbolHooks));
 }
 
+// Explorer.exe, to keep the space of a visible taskbar out of the work area.
+bool HookWorkAreaSymbols() {
+    WindhawkUtils::SYMBOL_HOOK symbolHooks[] = {
+        {
+            {LR"(private: int __cdecl CTray::RecomputeWorkArea(struct HMONITOR__ *,struct tagRECT *))"},
+            &CTray_RecomputeWorkArea_Original,
+            CTray_RecomputeWorkArea_Hook,
+        },
+        {
+            {LR"(public: virtual void __cdecl CTray::WorkAreaMayHaveChanged(struct HMONITOR__ *,struct HWND__ *))"},
+            &CTray_WorkAreaMayHaveChanged_Original,
+        },
+        // The CTray is also learned from the calls of explorer, so the global
+        // is only a fallback for the first update. The vftable is needed to
+        // find the interface of the CTray.
+        {
+            {LR"(struct CTrayStatic c_trayStatic)"},
+            &g_cTrayStatic,
+            nullptr,
+            true,
+        },
+        {
+            {LR"(const CTray::`vftable'{for `ITrayUIHost'})"},
+            &g_trayUIHostVftable,
+        },
+    };
+
+    return HookSymbols(GetModuleHandle(nullptr), symbolHooks,
+                       ARRAYSIZE(symbolHooks));
+}
+
 void LoadSettings() {
     PCWSTR monitors = Wh_GetStringSetting(L"monitors");
     g_settings.monitors = Monitors::all;
@@ -1388,6 +1858,7 @@ void LoadSettings() {
     Wh_FreeStringSetting(monitors);
 
     g_settings.maximizeToEdge = Wh_GetIntSetting(L"maximizeToEdge");
+    g_settings.reserveSpace = Wh_GetIntSetting(L"reserveSpace");
 
     g_settings.excludedPrograms.clear();
 
@@ -1452,6 +1923,15 @@ BOOL Wh_ModInit() {
         Wh_Log(L"HookExplorerSymbols failed, applications may leave a gap");
     }
 
+    // Only needed to keep the space of a visible taskbar.
+    g_workAreaSupported = HookWorkAreaSymbols();
+    if (g_workAreaSupported) {
+        StartBarThread();
+    } else {
+        Wh_Log(L"HookWorkAreaSymbols failed, maximized windows may go under a "
+               L"visible taskbar");
+    }
+
     HMODULE kernelBaseModule = GetModuleHandle(L"kernelbase.dll");
     auto pKernelBaseLoadLibraryExW = (decltype(&LoadLibraryExW))GetProcAddress(
         kernelBaseModule, "LoadLibraryExW");
@@ -1495,8 +1975,15 @@ void Wh_ModUninit() {
 
     g_unloading = true;
 
+    StopBarThread();
+
     if (HWND hMainTaskbarWnd = FindCurrentProcessTaskbarWnd()) {
         UpdateAppBarProps(hMainTaskbarWnd, /*restoreAll=*/true);
+
+        // Give back the space of the taskbars, from the thread of the taskbar.
+        DWORD_PTR result;
+        SendMessageTimeout(hMainTaskbarWnd, g_releaseWorkAreaRegisteredMsg, 0,
+                           0, SMTO_ABORTIFHUNG, 2000, &result);
     }
 
     if (g_wasAutoHideDisabled) {
