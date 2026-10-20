@@ -2,7 +2,7 @@
 // @id              auto-hide-taskbar
 // @name            Auto-Hide Taskbar (per monitor)
 // @description     Hides each taskbar only when a window on its own monitor is maximized or overlaps it
-// @version         0.1.0
+// @version         1.0.0
 // @author          flavienkohler
 // @github          https://github.com/flavienkohler
 // @include         explorer.exe
@@ -27,6 +27,8 @@ The taskbar stays visible, and slides away only when a window on **the same moni
 
 Taskbars on monitors that are not selected in the settings are always visible.
 
+Chromium-based apps (Chrome, VSCodium, Discord, ...) normally leave a 2 px gap at the bottom of a maximized window when the taskbar auto-hides. By default this mod hides the auto-hide state from applications on the managed monitors, so they maximize to the true screen edge.
+
 Derived from [Taskbar auto-hide when maximized](https://windhawk.net/mods/taskbar-auto-hide-when-maximized) by m417z (GPL-3.0). Written after that mod did not behave as expected on a two-monitor setup.
 */
 // ==/WindhawkModReadme==
@@ -40,6 +42,9 @@ Derived from [Taskbar auto-hide when maximized](https://windhawk.net/mods/taskba
   - all: All monitors
   - primary: Primary monitor only
   - secondary: Secondary monitors only
+- maximizeToEdge: true
+  $name: Maximize windows to the screen edge
+  $description: Chromium-based apps (Chrome, VSCodium, Discord, ...) leave a 2 px gap at the screen edge when maximized with an auto-hide taskbar. Enable this to make them use the whole screen on the monitors managed by the mod. It applies to windows maximized afterwards, and the taskbar is still revealed by moving the pointer to the screen edge.
 - excludedPrograms: [""]
   $name: Excluded programs
   $description: >-
@@ -58,6 +63,7 @@ Derived from [Taskbar auto-hide when maximized](https://windhawk.net/mods/taskba
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
+#include <vector>
 
 enum class Monitors {
     all,
@@ -67,6 +73,7 @@ enum class Monitors {
 
 struct {
     Monitors monitors;
+    bool maximizeToEdge;
     std::unordered_set<std::wstring> excludedPrograms;
 } g_settings;
 
@@ -567,6 +574,153 @@ bool ShouldKeepTaskbarShown(HWND hTaskbarWnd, HMONITOR monitor) {
     return !canHideTaskbar;
 }
 
+// Chromium-based apps (Chrome, Electron apps, ...) stop 2 px short of a screen
+// edge when a maximized window has an auto-hide taskbar there, which leaves a
+// visible gap. They find out in two ways, both answered here with "no
+// auto-hide taskbar" for the monitors managed by the mod:
+//
+// 1. SHAppBarMessage(ABM_GETAUTOHIDEBAR[EX]) is answered by shell32 from the
+//    window properties "WindowOnEdge:<monitor>:<edge>" of the main taskbar
+//    window, which hold the taskbar window, or 1 for none. The values are
+//    rewritten to 1 when explorer sets them, and the existing ones when the
+//    mod is loaded.
+// 2. If that finds nothing, SHAppBarMessage(ABM_GETSTATE) is used to check the
+//    ABS_AUTOHIDE flag, which is answered by explorer.
+
+constexpr WCHAR kWindowOnEdgePropPrefix[] = L"WindowOnEdge:";
+constexpr size_t kWindowOnEdgePropPrefixLen =
+    ARRAYSIZE(kWindowOnEdgePropPrefix) - 1;
+
+constexpr UINT kAppBarStateAutoHide = 0x1;  // ABS_AUTOHIDE
+
+std::mutex g_appBarPropsMutex;
+std::unordered_map<std::wstring, HANDLE> g_hiddenAppBarProps;
+std::atomic<DWORD> g_appBarMessageThreadId;
+std::atomic<bool> g_unloading;
+
+using SetPropW_t = decltype(&SetPropW);
+SetPropW_t SetPropW_Original;
+
+bool IsWindowOnEdgeProp(LPCWSTR name) {
+    return !IS_INTRESOURCE(name) &&
+           wcsncmp(name, kWindowOnEdgePropPrefix, kWindowOnEdgePropPrefixLen) ==
+               0;
+}
+
+// Whether the value of this property, which must be a "WindowOnEdge" one, has
+// to be replaced with "none".
+bool ShouldHideAppBarProp(PCWSTR name, HANDLE value) {
+    if (g_unloading || !g_settings.maximizeToEdge || (ULONG_PTR)value <= 1 ||
+        !IsWindow((HWND)value) || !IsTaskbarWindow((HWND)value)) {
+        return false;
+    }
+
+    HMONITOR monitor = (HMONITOR)(ULONG_PTR)wcstoul(
+        name + kWindowOnEdgePropPrefixLen, nullptr, 16);
+    return IsMonitorManaged(monitor);
+}
+
+BOOL WINAPI SetPropW_Hook(HWND hWnd, LPCWSTR lpString, HANDLE hData) {
+    // Called very often by explorer, keep the common case cheap.
+    if (IsWindowOnEdgeProp(lpString)) {
+        std::lock_guard<std::mutex> guard(g_appBarPropsMutex);
+
+        if (ShouldHideAppBarProp(lpString, hData)) {
+            Wh_Log(L"Hiding %s = %p from applications", lpString, hData);
+            g_hiddenAppBarProps[lpString] = hData;
+            hData = (HANDLE)1;
+        } else {
+            g_hiddenAppBarProps.erase(lpString);
+        }
+    }
+
+    return SetPropW_Original(hWnd, lpString, hData);
+}
+
+// SetProp that does not go through SetPropW_Hook (the caller holds the mutex).
+void SetPropDirect(HWND hWnd, PCWSTR name, HANDLE value) {
+    if (SetPropW_Original) {
+        SetPropW_Original(hWnd, name, value);
+    } else {
+        SetProp(hWnd, name, value);
+    }
+}
+
+// Hides the values set before the mod was loaded, and puts back the ones that
+// must not be hidden anymore (settings change), or all of them.
+void UpdateAppBarProps(HWND hTaskbarWnd, bool restoreAll = false) {
+    {
+        std::lock_guard<std::mutex> guard(g_appBarPropsMutex);
+        if (!restoreAll && !g_settings.maximizeToEdge &&
+            g_hiddenAppBarProps.empty()) {
+            return;
+        }
+    }
+
+    struct Prop {
+        std::wstring name;
+        HANDLE value;
+    };
+
+    std::vector<Prop> props;
+    EnumPropsEx(
+        hTaskbarWnd,
+        [](HWND, LPWSTR name, HANDLE value, ULONG_PTR param) -> BOOL {
+            if (IsWindowOnEdgeProp(name)) {
+                reinterpret_cast<std::vector<Prop>*>(param)->push_back(
+                    {name, value});
+            }
+            return TRUE;
+        },
+        reinterpret_cast<ULONG_PTR>(&props));
+
+    std::lock_guard<std::mutex> guard(g_appBarPropsMutex);
+
+    for (const auto& prop : props) {
+        auto it = g_hiddenAppBarProps.find(prop.name);
+        if (it != g_hiddenAppBarProps.end()) {
+            if (restoreAll ||
+                !ShouldHideAppBarProp(prop.name.c_str(), it->second)) {
+                SetPropDirect(hTaskbarWnd, prop.name.c_str(), it->second);
+                g_hiddenAppBarProps.erase(it);
+            }
+        } else if (ShouldHideAppBarProp(prop.name.c_str(), prop.value)) {
+            Wh_Log(L"Hiding %s = %p from applications", prop.name.c_str(),
+                   prop.value);
+            g_hiddenAppBarProps[prop.name] = prop.value;
+            SetPropDirect(hTaskbarWnd, prop.name.c_str(), (HANDLE)1);
+        }
+    }
+}
+
+// Marks the appbar messages sent by applications, as opposed to the calls made
+// by explorer itself, which must see the real state.
+using CTray__OnAppBarMessage_t = INT_PTR(WINAPI*)(void* pThis,
+                                                  COPYDATASTRUCT* copyData);
+CTray__OnAppBarMessage_t CTray__OnAppBarMessage_Original;
+INT_PTR WINAPI CTray__OnAppBarMessage_Hook(void* pThis,
+                                           COPYDATASTRUCT* copyData) {
+    DWORD prevThreadId = g_appBarMessageThreadId.exchange(GetCurrentThreadId());
+    INT_PTR ret = CTray__OnAppBarMessage_Original(pThis, copyData);
+    g_appBarMessageThreadId = prevThreadId;
+    return ret;
+}
+
+using CDeskTray_AppBarGetState_t = UINT(WINAPI*)(void* pThis);
+CDeskTray_AppBarGetState_t CDeskTray_AppBarGetState_Original;
+UINT WINAPI CDeskTray_AppBarGetState_Hook(void* pThis) {
+    UINT state = CDeskTray_AppBarGetState_Original(pThis);
+
+    // The state is not per monitor, it is the one of the main taskbar.
+    if ((state & kAppBarStateAutoHide) && g_settings.maximizeToEdge &&
+        !g_unloading && g_appBarMessageThreadId == GetCurrentThreadId() &&
+        IsMonitorManaged(MonitorFromPoint({0, 0}, MONITOR_DEFAULTTOPRIMARY))) {
+        state &= ~kAppBarStateAutoHide;
+    }
+
+    return state;
+}
+
 void* QueryViaVtable(void* object, void* vtable) {
     void* ptr = object;
     while (*(void**)ptr != vtable) {
@@ -786,6 +940,8 @@ LRESULT WINAPI TrayUI_WndProc_Hook(void* pThis,
             SetRectEmpty(rect);
         }
     } else if (Msg == g_updateTaskbarStateRegisteredMsg) {
+        UpdateAppBarProps(hWnd);
+
         if (!g_wasAutoHideProcessed) {
             g_wasAutoHideProcessed = true;
             g_wasAutoHideDisabled =
@@ -1200,6 +1356,25 @@ bool HookTaskbarSymbols() {
     return HookSymbols(module, symbolHooks, ARRAYSIZE(symbolHooks));
 }
 
+// Explorer.exe
+bool HookExplorerSymbols() {
+    WindhawkUtils::SYMBOL_HOOK symbolHooks[] = {
+        {
+            {LR"(protected: __int64 __cdecl CTray::_OnAppBarMessage(struct tagCOPYDATASTRUCT *))"},
+            &CTray__OnAppBarMessage_Original,
+            CTray__OnAppBarMessage_Hook,
+        },
+        {
+            {LR"(public: virtual unsigned int __cdecl CDeskTray::AppBarGetState(void))"},
+            &CDeskTray_AppBarGetState_Original,
+            CDeskTray_AppBarGetState_Hook,
+        },
+    };
+
+    return HookSymbols(GetModuleHandle(nullptr), symbolHooks,
+                       ARRAYSIZE(symbolHooks));
+}
+
 void LoadSettings() {
     PCWSTR monitors = Wh_GetStringSetting(L"monitors");
     g_settings.monitors = Monitors::all;
@@ -1209,6 +1384,8 @@ void LoadSettings() {
         g_settings.monitors = Monitors::secondary;
     }
     Wh_FreeStringSetting(monitors);
+
+    g_settings.maximizeToEdge = Wh_GetIntSetting(L"maximizeToEdge");
 
     g_settings.excludedPrograms.clear();
 
@@ -1249,6 +1426,10 @@ BOOL Wh_ModInit() {
     if (hUser32Module) {
         pGetWindowBand =
             (GetWindowBand_t)GetProcAddress(hUser32Module, "GetWindowBand");
+
+        WindhawkUtils::SetFunctionHook(
+            (SetPropW_t)GetProcAddress(hUser32Module, "SetPropW"),
+            SetPropW_Hook, &SetPropW_Original);
     }
 
     if (HMODULE taskbarViewModule = GetTaskbarViewModuleHandle()) {
@@ -1262,6 +1443,11 @@ BOOL Wh_ModInit() {
 
     if (!HookTaskbarSymbols()) {
         return FALSE;
+    }
+
+    // Only needed to remove the gap of Chromium-based apps.
+    if (!HookExplorerSymbols()) {
+        Wh_Log(L"HookExplorerSymbols failed, applications may leave a gap");
     }
 
     HMODULE kernelBaseModule = GetModuleHandle(L"kernelbase.dll");
@@ -1303,6 +1489,12 @@ void Wh_ModUninit() {
         WaitForSingleObject(g_winEventHookThread, INFINITE);
         CloseHandle(g_winEventHookThread);
         g_winEventHookThread = nullptr;
+    }
+
+    g_unloading = true;
+
+    if (HWND hMainTaskbarWnd = FindCurrentProcessTaskbarWnd()) {
+        UpdateAppBarProps(hMainTaskbarWnd, /*restoreAll=*/true);
     }
 
     if (g_wasAutoHideDisabled) {
