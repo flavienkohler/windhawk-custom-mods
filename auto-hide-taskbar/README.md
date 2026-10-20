@@ -49,4 +49,4 @@ Windhawk's log view shows, for each decision, the monitor's taskbar rectangle an
 
 ## Credits
 
-Derived from [Taskbar auto-hide when maximized](https://windhawk.net/mods/taskbar-auto-hide-when-maximized) by [m417z](https://github.com/m417z), published under GPL-3.0. The taskbar hooking, the Alt+Tab / Win+Tab detection and the program exclusion come from that mod. This version was created after the original did not behave as expected on a two-monitor setup, see [dev/issues.md](dev/issues.md).
+This is a modified version of [Taskbar auto-hide when maximized](https://windhawk.net/mods/taskbar-auto-hide-when-maximized) 1.2.6 by [m417z](https://github.com/m417z), published under GPL-3.0, like this mod. Most of the taskbar hooking, the Alt+Tab / Win+Tab detection and the program exclusion are his work. It was modified on 2026-10-20 after the original did not behave as expected on a two-monitor setup: the decision is taken for each monitor on its own, monitors can be left alone, and the gap of Chromium-based apps is removed.

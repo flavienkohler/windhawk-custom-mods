@@ -12,12 +12,14 @@
 
 // Source code is published under The GNU General Public License v3.0.
 //
-// Derived from "Taskbar auto-hide when maximized" by m417z (GPL-3.0):
+// This is a modified version of "Taskbar auto-hide when maximized" 1.2.6 by
+// m417z, published under the same license:
 // https://github.com/ramensoftware/windhawk-mods/blob/main/mods/taskbar-auto-hide-when-maximized.wh.cpp
-// The taskbar hooking, the Alt+Tab / Win+Tab handling and the program exclusion
-// come from that mod. This version was written after the original did not behave
-// as expected on a two-monitor setup: the decision is now taken for each monitor
-// on its own, and monitors can be left alone.
+// Most of the taskbar hooking, the Alt+Tab / Win+Tab handling and the program
+// exclusion are his work. Modified by flavienkohler on 2026-10-20: the decision
+// is taken for each monitor on its own, monitors can be left alone, the options
+// and the support of other Windows versions were removed, and the gap of
+// Chromium-based apps is removed.
 
 // ==WindhawkModReadme==
 /*

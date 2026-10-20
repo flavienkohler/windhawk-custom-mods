@@ -16,11 +16,13 @@ Personal [Windhawk](https://windhawk.net) mods, written to fix or replace behavi
 
 ## Structure
 
-Each mod lives in its own folder, with its code in `mod.wh.cpp` (the Windhawk source format), a `README.md` describing its behaviour and settings, and a `dev/` folder for design notes.
+Each mod lives in its own folder, with its code in `mod.wh.cpp` (the Windhawk source format) and a `README.md` describing its behaviour and settings.
 
 ## Credits and license
 
-Mods derived from someone else's work say so in their header and in their README. The repository is published under the GNU General Public License v3.0, see [LICENSE](LICENSE).
+The repository is published under the GNU General Public License v3.0, see [LICENSE](LICENSE). Mods derived from someone else's work say so in their header and in their README, and keep the license of the original:
+
+- [auto-hide-taskbar](auto-hide-taskbar) is a modified version of [Taskbar auto-hide when maximized](https://windhawk.net/mods/taskbar-auto-hide-when-maximized) by [m417z](https://github.com/m417z), published under GPL-3.0. Most of the taskbar hooking is his work.
 
 ## AI assistance
 
